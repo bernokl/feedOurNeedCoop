@@ -1,0 +1,205 @@
+# Capture of the process described in:
+https://jonascarpay.com/posts/2022-09-19-declarative-deployment.html
+#+begin_src tmux :session s1
+  echo yay it works
+#+end_src
+
+#+RESULTS:
+#+begin_src tmux
+#+end_src
+
+* Get aws set up
+- Go get your access keys by going to aws-console, there is a guide [[https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html][here]] 
+- In the navigation bar on the upper right, choose your user name, and then choose My Security Credentials.
+- Expand the Access keys (access key ID and secret access key) section
+- To create an access key, choose Create New Access Key
+- Download Key File.
+- Get aws cli set up, you can find a guide [[https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html][here]] 
+#+BEGIN_SRC tmux :session s1                                                 
+ cd ~/Downloads curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+ unzip awscliv2.zip
+ sudo ./aws/install 
+#+end_src
+- The setup should ask you for the access_key_id and aws_secret_access key, plus region, we are using: ap-southeast-2
+- You chould now have ~/.aws/config and ~/.aws/credentials with the information from the last step.
+- Test your setup with:
+#+begin_src tmux :session s1
+  aws sts get-caller-identity
+#+end_src
+- Mine returns my UserId, account and arn:
+#+begin_example
+ "Arn": "arn:aws:iam::000000000000:user/berno.kleinhans@yumi.com"
+#+end_example 
+* Terraform setup
+- There is a nice guide [[https://developer.hashicorp.com/terraform/tutorials/aws-get-started/install-cli][here]]
+- After install confirm with:
+#+begin_src tmux :session s1
+terraform -version
+#+end_src
+* Nix install
+- I did multi-user install, you can find a good guide [[https://nixos.org/download.html#nix-install-linux][here]]
+- once installed confirm your version with
+#+begin_src tmux :session s1
+nix --version
+#+end_src
+- I have 2.6.0. I see latest is 2.11.0 I might come back and upgrade, lets get started
+* Start the tutorial
+- Clone the repo down 
+  #+begin_src tmux :session s1
+  git clone https://github.com/jonascarpay/iplz.git
+  #+end_src
+** Use flake.nix to start a webserver that runs a simple script
+- The first file we fokus on is iplz/flake.nix this will be the scafolding you build your app in 
+#+begin_example
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs";
+    nixos-generators.url = "github:nix-community/nixos-generators";
+    nixos-generators.inputs.nixpkgs.follows = "nixpkgs";
+  };
+
+  outputs = inputs:
+    let
+      system = "x86_64-linux";
+      pkgs = import inputs.nixpkgs { inherit system; };
+
+      # Derivations and other expressions go here
+
+    in
+    {
+      packages.${system} = {
+        inherit
+          # Outputs go here
+          ;
+      };
+    };
+}
+#+end_example
+- I deleted most of what is in flake.nix (the tutorial shows a nice framework of what to keep)
+- Lets try and run it with update to our flake.nix we keep just buildPythonPackage and writeShellApplication plus iplz-server in outputs
+- From yumi/docs/bernoHome/iplz
+#+begin_src tmux :session s1
+nix run .#iplz-server
+#+end_src
+- Nice! The server comes up and will respond with my ip if curled
+** Next I need to Define my nix image
+- This will turn the application above into a deployable image
+- nixos-generators repository makes building images quick and easy
+- We will make 2 images:
+- We’ll make a QEMU-based self-contained VM image that we can run locally. We use this image to test and debug before deployment.
+- Once that’s done, we define the actual EC2 image that will form the basis for our instances.
+- NICE! this flake.nix file will give me a local vm that spins up with the packages ran so we can curl it
+- To deploy the vm locally (you should see a terminal with new nix based qemu server) run:
+#+BEGIN_SRC tmux :session s1
+nix run .#iplz-vm
+#+END_SRC
+#+begin_example
+{
+## I think of these like python imports, seems to be libraries we want set up for our environment
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs";
+    nixos-generators.url = "github:nix-community/nixos-generators";
+    nixos-generators.inputs.nixpkgs.follows = "nixpkgs";
+  };
+
+## These feels like results I want and How I want them packaged
+
+  outputs = inputs:
+
+## Set processing and other system packages needed (if I change this system will this work on OSX)
+## TODO: Test this config on mac with system changed, that would be very impressive
+
+    let
+      system = "x86_64-linux";
+      pkgs = import inputs.nixpkgs { inherit system; };
+
+## Here I am defining iplz-lib I will be calling in the iplz-server below.
+## The falcon package here is a light weight web service that will host a little program to return origin-ip for any web requests it recieves
+## You can read more about falcon here: https://falcon.readthedocs.io/en/stable/
+      # Step 1. Write application
+      iplz-lib = pkgs.python3Packages.buildPythonPackage {
+        name = "iplz";
+        src = ./app;
+        propagatedBuildInputs = [ pkgs.python3Packages.falcon ];
+      };
+
+## Here we stand up a unicorn simple CPU emulator (disposable runtime container) with a built in python API for setup
+## Either way this defines a service that accepts http requests passing them on to the iplz-server
+## The iplz-server has the little falcon http python service running inside it
+## This keeps your process running, this is good for quick testing of your application logic withou spinning up a whole machine, just this program is run.
+## You can read more about unicorn here https://pypi.org/project/unicorn/
+
+      iplz-server = pkgs.writeShellApplication {
+        name = "iplz-server";
+        runtimeInputs = [ (pkgs.python3.withPackages (p: [ p.uvicorn iplz-lib ])) ];
+        text = ''
+          uvicorn iplz:app "$@"
+        '';
+      };
+
+## This is a more robust description of qemu (Traditional linux virtual machines)
+## Stateversion seems to be like ubuntu release version, it is pinned packages yolu can expect 22.05 is the top level version for this system.stateVersion
+## Notice that we are calling the iplz-server inside this virtual machine
+## Now the service that will call our http server to give it a runtime environment is inside a VM
+## It is like a russian nesting doll :) http_service -> runtimeEnvironment -> VM
+## We are also defining systemd.service.iplz so we have a supervisor keeping our runtime environment running
+
+      base-config = {
+        system.stateVersion = "22.05";
+        networking.firewall.allowedTCPPorts = [ 80 ];
+        systemd.services.iplz = {
+          enable = true;
+          wantedBy = [ "multi-user.target" ];
+          after = [ "network.target" ];
+          script = ''
+            ${iplz-server}/bin/iplz-server --host 0.0.0.0 --port 80
+          '';
+          serviceConfig = {
+            Restart = "always";
+            Type = "simple";
+          };
+       };
+     };
+
+## This is VM system level configurations
+## We set root auto login for the vm when it comes up
+## We open up ports from the VM to the hosts system
+
+     qemu-config = {
+        services.getty.autologinUser = "root";
+        virtualisation.forwardPorts = [{ from = "host"; host.port = 8000; guest.port = 80; }];
+     };
+
+## This is where we combine the above two packages into a vm that is configured and running the service we defined above
+## I need to learn more about nixos-generator it seems like a very efficient package store where you can define combinations of the above for use
+
+     iplz-vm = inputs.nixos-generators.nixosGenerate {
+        inherit pkgs;
+        format = "vm";
+        modules = [
+          base-config
+          qemu-config
+       ];
+     };
+
+## This is where we define the actual "nix flakes" we can call ie
+## "nix run .#iplz-server" - This will spin up just the falcon server in runtime that will allow us to curl localhost:8000 to interact with our python script
+## "nix run .#iplz-vm" - this will spin up the vm running nixos, with a little falcon webserver serving our python app
+    in
+    {
+      packages.${system} = {
+        inherit
+          iplz-server
+          iplz-vm;
+      };
+    };
+}
+#+end_example
+
+* New side quest
+- I need to understand nix flake ralationship to .git
+- The store seems like it breaks if I remove the .git repo in the root of my repo
+#+BEGIN_EXAMPLE
+warning: Git tree '/home/bkleinhans/projects/yumi/docs/bernoHome/iplz
+#+END_EXAMPLE
