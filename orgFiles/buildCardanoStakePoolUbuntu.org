@@ -1,0 +1,385 @@
+#+TITLE: Buid Cardano Stake Pool Ubuntu
+
+- Goal translate this [How to](https://cardano-foundation.gitbook.io/stake-pool-course/stake-pool-guide/getting-started/install-node) into Ubuntu install instructions
+- This is complete guide for starting a nodepool on the testnet. It does require lots of manual steps, these can mostly be scripted and automated.
+- Considering this is infrequently touched infra besides a good upgrade process and monitoring I am not sure how much time you want to spend automating.
+* Install dependencies
+   #+begin_src tmux :session tmux-old-host
+sudo apt update
+   #+end_src
+   #+begin_src tmux :session tmux-old-host
+sudo apt upgrade
+   #+end_src
+   #+begin_src tmux :session tmux-old-host
+sudo apt-get install build-essential pkg-config libffi-dev libgmp-dev -y
+sudo apt-get install libssl-dev libtinfo-dev libsystemd-dev zlib1g-dev -y
+sudo apt-get install make g++ tmux git jq wget libncursesw5 libtool autoconf -y
+   #+end_src
+
+* Get cabal
+   #+begin_src tmux :session tmux-old-host
+wget https://downloads.haskell.org/~cabal/cabal-install-3.2.0.0/cabal-install-3.2.0.0-x86_64-unknown-linux.tar.xz
+tar -xf cabal-install-3.2.0.0-x86_64-unknown-linux.tar.xz
+rm cabal-install-3.2.0.0-x86_64-unknown-linux.tar.xz cabal.sig
+mkdir -p ~/.local/bin
+mv cabal ~/.local/bin/
+   #+end_src
+
+# Add this to the bottom of ~/.bashrc and source it
+export PATH="~/.local/bin:$PATH"
+
+  # Confirm
+   #+begin_src tmux :session tmux-old-host
+echo $PATH
+   #+end_src
+   #+begin_src tmux :session tmux-old-host
+cabal update
+   #+end_src
+   #+begin_src tmux :session tmux-old-host
+cabal --version
+   #+end_src
+
+* Download and install GHC
+   #+begin_src tmux :session tmux-old-host
+wget https://downloads.haskell.org/~ghc/8.10.2/ghc-8.10.2-x86_64-deb9-linux.tar.xz
+tar -xf ghc-8.10.2-x86_64-deb9-linux.tar.xz
+rm ghc-8.10.2-x86_64-deb9-linux.tar.xz
+cd ghc-8.10.2
+./configure
+sudo make install
+cd ..
+   #+end_src
+   #+begin_src tmux :session tmux-old-host
+ghc --version
+   #+end_src
+
+* Install Libsodium
+   #+begin_src tmux :session tmux-old-host
+export LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH"
+export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH"
+git clone https://github.com/input-output-hk/libsodium
+cd libsodium
+git checkout 66f017f1
+./autogen.sh
+./configure
+make
+sudo make install
+   #+end_src
+
+* Download source code for cardan-node
+   #+begin_src tmux :session tmux-old-host
+cd
+git clone https://github.com/input-output-hk/cardano-node.git
+   #+end_src
+   #+begin_src tmux :session tmux-old-host
+ls cardano-node
+   #+end_src
+   #+begin_src tmux :session tmux-old-host
+cd cardano-node
+   #+end_src
+   #+begin_src tmux :session tmux-old-host
+git fetch --all --tags
+   #+end_src
+   #+begin_src tmux :session tmux-old-host
+git tag
+   #+end_src
+   #+begin_src tmux :session tmux-old-host
+git checkout tags/1.25.1
+   #+end_src
+   #+begin_src tmux :session tmux-old-host
+cabal clean
+cabal update
+cabal build all
+   #+end_src
+# Copy the executable files to .local/bin
+   #+begin_src tmux :session tmux-old-host
+cp -p dist-newstyle/build/x86_64-linux/ghc-8.10.2/cardano-node-1.25.1/x/cardano-node/build/cardano-node/cardano-node ~/.local/bin/
+   #+end_src
+   #+begin_src tmux :session tmux-old-host
+cp -p dist-newstyle/build/x86_64-linux/ghc-8.10.2/cardano-cli-1.25.1/x/cardano-cli/build/cardano-cli/cardano-cli ~/.local/bin/
+   #+end_src
+   #+begin_src tmux :session tmux-old-host
+cardano-cli --version
+   #+end_src
+#   Make a backup
+   #+begin_src tmux :session tmux-old-host
+cd ~/.local/bin
+cp cardano-cli cardano-cli-backup
+cp cardano-node cardano-node-backup
+   #+end_src
+
+* Get configuration files
+   #+begin_src tmux :session tmux-old-host
+cd
+mkdir relay
+cd relay
+   #+end_src
+- This has updated, it looks like cardano keeps all the files at https://book.world.dev.cardano.org/environments.html#
+- It looks like the cardano ops book is about 50% writen, but node-peer sources seem to be accurate.
+   #+begin_src tmux :session tmux-old-host
+wget https://hydra.iohk.io/job/Cardano/cardano-node/cardano-deployment/latest-finished/download/1/testnet-config.json
+wget https://hydra.iohk.io/job/Cardano/cardano-node/cardano-deployment/latest-finished/download/1/testnet-shelley-genesis.json
+wget https://hydra.iohk.io/job/Cardano/cardano-node/cardano-deployment/latest-finished/download/1/testnet-byron-genesis.json
+wget https://hydra.iohk.io/job/Cardano/cardano-node/cardano-deployment/latest-finished/download/1/testnet-topology.json
+   #+end_src
+* Generate some keys
+   #+begin_src tmux :session tmux-old-host
+cardano-cli node key-gen \
+--cold-verification-key-file cold.vkey \
+--cold-signing-key-file cold.skey \
+--operational-certificate-issue-counter-file cold.counter
+   #+end_src
+* Start my node
+   #+begin_src tmux :session tmux-old-host
+cardano-node run \
+--topology testnet-topology.json \
+--database-path db \
+--socket-path db/node.socket \
+--host-addr 0.0.0.0 \
+--port 3001 \
+--config testnet-config.json
+   #+end_src
+* Transactions
+Generate a payment key pair
+   #+begin_src tmux :session s1
+ cardano-cli address key-gen \
+ --verification-key-file payment.vkey \
+ --signing-key-file payment.skey
+   #+end_src
+We then use payment.vkey to create our payment address
+   #+begin_src tmux :session s1
+ cardano-cli address build \
+ --payment-verification-key-file payment.vkey \
+ --out-file payment.addr \
+ --testnet-magic 1097911063
+   #+end_src
+
+- To query the node, set local node socket path
+- Add this to the bottom of ~/.bashrc
+   #+begin_src tmux :session s1
+export CARDANO_NODE_SOCKET_PATH=~/relay/db/node.socket
+   #+end_src
+
+Lets see what we get
+   #+begin_src tmux :session s1
+cardano-cli query utxo --address $(cat ~/relay/payment.addr) --testnet-magic 1097911063
+   #+end_src
+
+Once we have payment keys we can request funds for our node from the faucet (use ~/relay/payment.addr)
+https://testnets.cardano.org/en/testnets/cardano/tools/faucet/
+
+* After the node is up
+** Generate stake keys and address
+Stake key pair
+   #+begin_src tmux :session s1
+ cardano-cli stake-address key-gen \
+ --verification-key-file stake.vkey \
+ --signing-key-file stake.skey
+   #+end_src
+** Registser address in the blockchain
+   #+begin_src tmux :session s1
+    cardano-cli stake-address build \
+ --stake-verification-key-file stake.vkey \
+ --out-file stake.addr \
+ --testnet-magic 1097911063
+   #+end_src
+** Regenrate payment address
+   #+begin_src tmux :session s1
+ cardano-cli address build \
+ --payment-verification-key-file payment.vkey \
+ --stake-verification-key-file stake.vkey \
+ --out-file paymentwithstake.addr \
+ --testnet-magic 1097911063
+   #+end_src
+* Register stake address in the blockchain
+** Generate registration certificate
+   #+begin_src tmux :session s1
+cardano-cli stake-address registration-certificate \
+--stake-verification-key-file stake.vkey \
+--out-file stake.cert
+   #+end_src
+* Create a transaction hash of what we have
+
+   #+begin_src tmux :session s1
+cardano-cli transaction build-raw \
+--tx-in bf928c6dd9126867624c2be53a017b35f8f4cf1a1392d1196b00e5366e8b0dcd#0 \
+--tx-out $(cat paymentwithstake.addr)+0 \
+--ttl 0 \
+--fee 0 \
+--out-file tx.raw \
+--certificate-file stake.cert
+   #+end_src
+* Make protocol file
+- Otherwise you will get:
+- protocol.json: openBinaryFile: does not exist (No such file or directory)
+   #+begin_src tmux :session s1
+cardano-cli  query protocol-parameters --testnet-magic 1097911063 --out-file protocol.json
+   #+end_src
+* Calculate the fee
+   #+begin_src tmux :session s1
+cardano-cli transaction calculate-min-fee \
+--tx-body-file ~/relay/tx.raw \
+--tx-in-count 1 \
+--tx-out-count 1 \
+--witness-count 1 \
+--byron-witness-count 0 \
+--testnet-magic 1097911063 \
+--protocol-params-file protocol.json
+   #+end_src
+
+* We can now update our transaction with the correct fee and output
+- Input - fee - statepooldepolsit = output
+- Make sure you are using the input from the actual correct transaction
+   #+begin_src tmux :session s1
+cardano-cli transaction build-raw \
+--tx-in 0d459a3651408c4eb9ee22ce3c815dddac67b488d6c0c8f4fb9fa473f2d6b9bd#0 \
+--tx-out $(cat paymentwithstake.addr)+997827239 \
+--fee 172761 \
+--out-file tx.raw \
+--certificate-file stake.cert
+   #+end_src
+* Sign the transaction
+   #+begin_src tmux :session s1
+cardano-cli transaction sign \
+--tx-body-file tx.raw \
+--signing-key-file payment.skey \
+--signing-key-file stake.skey \
+--testnet-magic 1097911063 \
+--out-file tx.signed
+   #+end_src
+* Submit
+   #+begin_src tmux :session s1
+cardano-cli transaction submit \
+--tx-file tx.signed \
+--testnet-magic 1097911063
+   #+end_src
+
+
+* Go look at our new transaction
+#+begin_src tmux :session s1
+cardano-cli query utxo \
+--address $(cat payment.addr) \
+--testnet-magic 1097911063
+#+end_src
+
+* Create core node and use the above relay nodes
+
+   #+begin_src tmux :session s1
+cd
+mkdir pool
+cd pool
+wget https://hydra.iohk.io/job/Cardano/cardano-node/cardano-deployment/latest-finished/download/1/testnet-config.json
+wget https://hydra.iohk.io/job/Cardano/cardano-node/cardano-deployment/latest-finished/download/1/testnet-shelley-genesis.json
+wget https://hydra.iohk.io/job/Cardano/cardano-node/cardano-deployment/latest-finished/download/1/testnet-topology.json
+   #+end_src
+
+* Update your node to only talk to the relay nodes you want
+#+BEGIN_SRC json :tangle ~/testnet-topology.json
+{
+  "Producers": [
+    {
+      "addr": "relays-new.cardano-testnet.iohkdev.io",
+      "port": 3001,
+      "valency": 2
+    },
+    {
+      "addr": "relays.testnet.stakenuts.com",
+      "port": 3001,
+      "continent": "North America",
+      "state": "New Jersey"
+    }
+  ]
+}
+#+end_src
+
+* Repeat steps 1-5 above
+1 Install dependencies
+2 Install Cabal and ghc
+3 Install libsodium
+4 Donwload and set up cardano source code
+5 Download config files
+
+* Set KES key pair on relay node
+** Get our kurrent KES setting
+#+begin_src tmux :session s1
+cat testnet-shelley-genesis.json | grep KES
+#+end_src
+
+#+begin_example
+cat testnet-shelley-genesis.json | grep KES
+  "slotsPerKESPeriod": 129600,
+  "maxKESEvolutions": 62,
+#+end_example
+** Lets go find the current tip of the relay node
+On the first node we built
+#+begin_src tmux :session s1
+cardano-cli query tip --testnet-magic 1097911063
+#+end_src
+
+#+begin_example
+{
+    "epoch": 172,
+    "hash": "6867fca602e28e53334c9b50006b4c615058dd8df55de64efb6c96ef8471e3ea",
+    "slot": 43951581,
+    "block": 3116377,
+    "era": "Alonzo",
+    "syncProgress": "100.00"
+}
+#+end_example
+
+** Run expression to see the slot we are in
+#+begin_src tmux :session s1
+expr 43951581 / 129600
+#+end_src
+
+** Create keys.skey for our node
+
+#+begin_src tmux :session s1
+cardano-cli node key-gen-KES \
+    --verification-key-file kes.vkey \
+    --signing-key-file kes.skey
+#+end_src
+
+** Create operational certificate for our stake pool
+
+#+begin_src tmux :session s1
+cardano-cli node issue-op-cert \
+    --kes-verification-key-file kes.vkey \
+    --cold-signing-key-file cold.skey \
+    --operational-certificate-issue-counter cold.counter \
+    --kes-period 339 \
+    --out-file node.cert
+#+end_src
+
+* Create stake pool keys on the core node
+#+begin_src tmux :session s1
+mkdir pool-keys
+cd pool-keys
+#+end_src
+*** Generate cold keys and a cold counter
+#+begin_src tmux :session s1
+cardano-cli node key-gen \
+--cold-verification-key-file cold.vkey \
+--cold-signing-key-file cold.skey \
+--operational-certificate-issue-counter-file cold.counter
+#+end_src
+*** Generate VRF Key pair
+#+begin_src tmux :session s1
+cardano-cli node key-gen-VRF \
+--verification-key-file vrf.vkey \
+--signing-key-file vrf.skey
+#+end_src
+*** Generate KES Key pair
+#+begin_src tmux :session s1
+cardano-cli node key-gen-KES \
+--verification-key-file kes.vkey \
+--signing-key-file kes.skey
+#+end_src
+*** Generate operational certificate for the core node
+You will need to run this on a working node, it does not need to be core, you are just looking for the current slot
+#+begin_src tmux :session s1
+cardano-cli query tip --testnet-magic 1097911063
+#+end_src
+#+begin_src tmux :session s1
+f scat ../testnet-shell-
+#+end_src
