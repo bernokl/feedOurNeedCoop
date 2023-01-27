@@ -1,0 +1,672 @@
+* Stand up working Cardano relay and block producer in AWS using NIX
+- This is fully functioning process as of 20230226, this however is the document of the entire exploration and goes over lots of details that does not make it into the final build. 
+- If you want a more concise set of steps to acomplish this goal go to diypool_apply.org, it was created using this document and used for the last full install of the infra.
+- We will stand up the nix infra described in the diypool repo using AWS
+- Based on: https://github.com/diypool/diy
+* Step 1: Install wiregaurd locally, I prefer wireguard bastion
+- I decided to make this a manual cloud instance to ensure happy-path functionality for now
+- Spun up an instance using the console, selected t2.medium, 8gb drive with its own keypair
+- TODO: Make this bastion host wireguard nixos install.
+- Note, you can onlly fully set this up once your two nodes have been terraformed and initial cardano-configuration.nix applied to get wireguard configured to provide you with ip's and keys you will need below.
+- https://www.wireguard.com/
+- Looks like simple apt install:
+#+begin_src tmux :session s1
+sudo apt install wireguard-tools
+#+end_src
+- Following https://www.wireguard.com/quickstart/
+- Create private keys:
+#+begin_src tmux :session s1
+umask 077
+wg genkey > /tmp/privatekey
+#+end_src
+- Create public keys:
+#+begin_src tmux :session s1
+wg pubkey < /tmp/privatekey > /tmp/publickey
+#+end_src
+- Configure wireguard for your nodes. 
+- TODO: NOTE the config below will not persiste, you will have to output it to a wiregaurd config file if you want it to persist, leaving mine ephemeral for now so I can test
+- Could never quite get the below to work
+#+begin_src tmux :session s1
+  ip link add dev wg0 type wireguard
+  ip address add dev wg0 10.100.0.1/32
+  # wg set wg0 listen-port 51820 private-key /path/to/private-key peer relay_host allowed-ips 10.100.0.2/32 endpoint [ec2 instance ip]:8172
+  wg set wg0 listen-port 51820 private-key /keys/wg/privatekey peer 8zTFBp9AFWp10SOV+6pgz7eGy9JFT7sKFOGJnB89qXE= allowed-ips 10.100.0.3/32 endpoint 3.26.99.226:8172
+  wg set wg0 listen-port 51820 private-key /keys/wg/privatekey peer 8zTFBp9AFWp10SOV+6pgz7eGy9JFT7sKFOGJnB89qXE= allowed-ips 10.100.0.3/32 endpoint 172.31.18.88:8172
+  # wg set wg0 listen-port 51820 private-key /path/to/private-key peer relay-host allowed-ips 10.100.0.3/32 endpoint [ec2 instance ip]:8172
+  wg set wg0 listen-port 51820 private-key /keys/wg/privatekey peer gwb/UgbjYjJiDF7EztMG86jxQjBJA0fzq2MhxwY5F20= allowed-ips 10.100.0.1/32 endpoint 13.211.49.44:8172
+  # Will do this when we have a second machine
+  ip link set up dev wg0
+#+end_src
+- OK, did hybrid using config file described in the diy/README we are following
+- Ran this:
+#+begin_src tmux :session s1
+ip link add dev wg0 type wireguard
+ip address add dev wg0 10.100.0.1/32
+#+end_src
+- Created this config in /etc/wireguard/wg0.conf
+- I am aware this document shares privatekeys, these instances will all be replaced when we go live
+#+begin_example
+[Interface]
+PrivateKey = xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  
+ListenPort = 51820
+
+[Peer]
+PublicKey = xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+AllowedIPs = 10.100.0.3/32
+Endpoint = 3.26.147.185:51820
+PersistentKeepalive = 21
+
+#[Peer]
+#PublicKey = <BP_WG_PUBLIC_KEY>
+#AllowedIPs = 10.100.0.2/32
+#Endpoint = <BP_IP>:<BP_WG_PORT>
+#PersistentKeepalive = 21
+#+end_example
+- I aplied the above to my running wireguard with:
+#+begin_src tmux :session s1
+wg setconf wg0 /etc/wireguard/wg0.conf
+#+end_src
+- I had to manually bring up the wg0 device
+#+begin_src tmux :session s1
+ip link set up dev wg0
+#+end_src
+- I noticed this did not provide my machine with a route for the wg0 traffic so I manually ran:
+#+begin_src tmux :session s1
+ip route add 10.100.0.0/24 dev wg0
+#+end_src
+- Another change is to manually whitelist the external ips for each instance in the security group attached to each instance.
+- Go to aws-console -> ec2 -> instances -> select an instance -> click security tab in bottom half. click on the sg-00a4c2c369b....xx. link. 
+- You are now on the page with the security group attached to the instance, make sure for incoming traffic you allow the relevant ports from the ip address of the other instances it will be communicating with.
+- Ideally all 3 share the same security group and you can simply whitelist the 3 ips (relay, block, bastion) in that one security group. You can find the external ip for each node in the ec2-aws-consle
+- The above takes attention to detail, write it out, or copy paste to doc like I do, either way if you miss one you will have traffic drop before it ever hits your node without explanation
+- Troubleshooting involves telnet, tcpdump and a few more, it is a PITA, but carefule elimination of issues will work in the end.
+- From this point forward I could reach relay nodes using the 10. address
+#+begin_example
+> telnet 10.100.0.3 22
+Trying 10.100.0.3...
+Connected to 10.100.0.3.
+Escape character is '^]'.
+SSH-2.0-OpenSSH_9.1
+#+end_example
+- NOTE: The above is far from ideal we are routing our encrypted traffic via public networks when we could do all of this isolation with AWS VPC and no public ip on our block producer. I did choose to make this work via external ips because I suspect that is more the intent for how it will be used over public networks. We have been discussing tailscale for this network topology security so for now this wiregaurd configuration sticks to the original design intent best.
+- TODO: Do the above using tailscale, you will need to go up into the diy.configuration.nix to replace wireguard configuration with talescale.
+* Step2: Install nodes nixOS
+** 1st method will be using nix-env -i ec2-api-tools DEPRICATED FOR NOW 
+- There is still a lot of encouragement to use terraform for cloud orchastration, I am going to heed these warnings for now.
+- The below was just POC, that did lead to working instance.
+- We will be using:: How to install nixos on aws https://nixos.wiki/wiki/Install_NixOS_on_Amazon_EC2
+- Looks like this will not run without allowiUnfree=true;
+- Looks like the permanent solution is to set { allowUnfree = true; } in /.config/nixpkgs/config.nix
+- But for this test I am just going to set the env var:
+#+begin_src tmux :session s1
+export NIXPKGS_ALLOW_UNFREE=1
+#+end_src
+- Install ec2-api tools:
+#+begin_src tmux :session s1
+nix-env -i ec2-api-tools
+#+end_src
+- Lets go create ssh-keypair
+#+begin_src tmux :session s1
+ec2-add-keypair -O [aws_access_key_id] -W [aws_secret_access_key] -k gsg-keypair 
+#+end_src
+- Lets spin up an instance, I got the ami from ami Catalog, public for now. Will need to find secure ami or build our own 
+#+begin_src tmux :session s1
+  ## This will request a spot instance for .30c p/m
+  ##  ec2-request-spot-instances -t t2.nano -O [aws_access_key_id] -W  -k gsg-keypair -p 0.3 ami-0508167db03652cc4
+  ec2-run-instances -t t2.nano -O [aws_access_key_id] -W [aws_secret_access_key] -k gsg-keypair ami-0508167db03652cc4
+#+end_src
+- This feels a bit clunky. Issues to consider:
+- It selected my region and did not honor me passing in --region, how do I fix this
+- I do not see a simple way to run init scripts.
+** 2nd method using terraform, CURRENT.
+- For now it is the deploy strategy I will evolve, terraform gives me better support and more flexibility to also use other cloud providers.
+- We will be spinning up instance using https://github.com/guessi/terraform-ec2-minimal
+- I need a pem key for ssh to the machine, going to use ec2-add-keypair to create keypair for this test 
+#+begin_src tmux :session s1
+ec2-add-keypair  --region ap-southeast-2 -O [aws_access_key_id] -W [aws_secret_access_key] -k yumi-test-4 
+#+end_src
+- Ok verified the key exists in that region. Copy the output of the above to .ssh/yumi-test-4.pem
+- Lets update config and init/plan/apply
+- I update the key-value in variables.tf right next to the "//FIXME: replace the key name here"
+- I did notice it pulls region from my .aws/config. I think that is fine, but needs to be considered
+TODO: Set region for deploy in terraform
+TODO: Set tf-state to s3
+- Init:
+#+begin_src tmux :session s1
+terraform init
+#+end_src
+- Plan:
+#+begin_src tmux :session s1
+terraform plan
+#+end_src
+- Apply/deploy:
+#+begin_src tmux :session s1
+terraform apply
+#+end_src
+- Nice I see ubuntu image with the packages installed by the init script.
+- Lets see if I can update the ami-filter to suit my needs
+- OK this took WAY too long, oficial nix amis can be found on https://nixos.org/download.html#nixos-amazon
+- So current ami for ap-southeast-2 is ami-0638db75ba113c635
+- Lets update main.tf with this ami's owner-id and name to reflect nix instead of ubuntu
+- Run terraform apply 
+- Verified I can stand the NixOS version of the machine up. Able to ssh to it and confirm it is running NixOS 22.11
+** Customize nix install to prepare for node-install
+- Really nice example of a bit more flushed out main.tf https://www.middlewareinventory.com/blog/terraform-aws-example-ec2/
+- Looks like we will need a 40 gig disk, add this block to the aws_instance section in main.tf
+- NOTE: system choices like disk space, cpu/ram is terraform, the rest of the configuration on OS level will be NixOS
+#+begin_example
+  root_block_device {
+    delete_on_termination = true
+    volume_size = 40
+    volume_type = "gp2"
+  }
+#+end_example
+- I need to add a 16G volume of swap, I can do this by adding the following to configuration.nix because this is configuration inside the tf system
+#+begin_example
+  swapDevices = [
+    {
+      device = "/swapfile";
+      priority = 50;
+      size =  16384;
+    }
+  ];
+#+end_example
+- Manually tested the above and ended with the swap space I needed.
+- I need to make the configuration.nix file a terraform template I can render so I can spin it up when I start
+- Create local copy for configuration.nix with correct configuration
+- Add block to main.tf upload the file to remote host
+- TODO: Need to fix file permissions /etc/nixos/configuration.nix ends up as 444, I understand long term we bake ami with the file we want to apply pulled from a repo with configurations, but for now we are manually evolving this file as we build our nodes
+#+begin_example
+  provisioner "file" {
+    source      = "./configuration.nix"
+    destination = "/etc/nixos/configuration.nix"
+
+    connection {
+      type        = "ssh"
+      user        = "root"
+      private_key = "${file("~/Downloads/yumi-test-4.pem")}"
+      host        = "${self.public_dns}"
+    }
+  }
+#+end_example
+- Note I am hard-coding the .pem file, need to create secrets to render these from
+- Update main.tf user_data to run "nixos-rebuild switch" 
+#+begin_example
+data "template_cloudinit_config" "default" {
+  base64_encode = false
+  gzip = false
+
+  part {
+    content_type = "text/x-shellscript"
+    content      = <<-EOF
+    #!/bin/sh
+    echo hi > /tmp/hi
+    nixos-rebuild switch
+    EOF
+  }
+}
+#+end_example
+- Spin up new instance with "terraform apply"
+- Log into instance confirm it has correct configuration.nix and swap file has been added
+- Conclusion: We now have a simple scafold for executing startup script to do any work we need done on the os at startup
+** Install block producer
+- Doing this step so we can complete the wiregaurd setup
+- Splitting terraform into 2 directories. Will need to think about complexity and duplication, possibly terragrunt, but just duplication with slight customization for now.
+- Spent a bit of time re-factoring code to seperate relay from block_producer
+- now cd to ec2-cardano-node/block_producer_node/ and run init/plan/apply there
+- OK, confirmed I can stand the two nodes up, note I added tags to identify each, other than that they are still identical.
+- 
+* Install WireGaurd on node machines ie relay, block producer
+- Create WG keys directory
+#+begin_src tmux :session s1
+umask 077
+mkdir -p /keys/wg
+cd /keys/wg
+#+end_src
+- Create keys
+#+begin_src tmux :session s1
+nix-shell -p wireguard-tools --run 'wg genkey | tee privatekey | wg pubkey > publickey'
+#+end_src
+- Lets go finish the setup we started in step 1
+- I need to install wiregaurd, most direct route would seem to be to include the configuration.nix from the example
+- Did include in main configuration.nix of files/cardano-configuration.nix I created from the example
+#+begin_example
+ imports = 
+   [ 
+     "${modulesPath}/virtualisation/amazon-image.nix" 
+     .cardano-configuration.nix
+];
+#+end_example
+#+begin_example
+{ config, pkgs, lib, ... }:
+
+let
+
+  diySrc = builtins.fetchTarball {
+    url = "https://github.com/diypool/diy/archive/refs/tags/v0.0.1.tar.gz";
+    sha256 = "1aisjrd1zrmyx5bzbhig6bxzzl25ar6ksfvpixlsk7ibag3p24sa";
+  };
+
+  diy = import "${diySrc}/nix/nixos/diy.nix" {
+    config = config;
+    pkgs = pkgs;
+    lib = lib;
+
+    cardano-node-src = {
+      url = "https://github.com/input-output-hk/cardano-node/archive/refs/tags/1.27.0.tar.gz";
+      hash = "1c9zc899wlgicrs49i33l0bwb554acsavzh1vcyhnxmpm0dmy8vj";
+    };
+    cardano-rt-view-src = {
+      url = "https://github.com/input-output-hk/cardano-rt-view/archive/0.3.0.tar.gz";
+      hash = "0m6na9gm0yvkg8z9w8f2i2isd05n2p0ha5y1j1gmciwr5srx4r60";
+    };
+  };
+
+in
+
+{
+  nix.binaryCaches = [
+    "https://hydra.iohk.io"
+  ];
+
+  nix.binaryCachePublicKeys = [
+    "hydra.iohk.io:f/Ea+s+dFdN+3Y/G+FDgSq+a5NEWhJGzdjvKNGv0/EQ="
+  ];
+
+  imports =
+    [ # Include the results of the hardware scan.
+      diy
+    ];
+
+  boot.loader.grub.device = "/dev/xvda";
+
+  services.stake-pool = {
+    name = "YUMI_DEV";
+
+    ssh = {
+      port = 22;
+      public-key = ''[public-key for yumi-test-4]'';
+    };
+
+    cardano-node = {
+      enable = false;
+      port = 3001;
+      tracePort = 8000;
+    };
+
+    cardano-rt-view = {
+      port = 8088;
+    };
+
+    topology = [
+      {
+        addr = "<relay-node-ip>";
+        port = 3001;
+        valency = 1;
+      }
+      # Pick 15-20 relays from this list https://explorer.mainnet.cardano.org/relays/topology.json
+      # Make sure to pick a few that are geographically close to your relay
+      # Then pick nodes from a variety of geographic locations
+      {
+        addr = "preprod-node.world.dev.cardano.org";
+        port = 30000;
+        valency = 1;
+      }
+    ];
+
+    wireguard = {
+      port = 51820;
+      peerPublicKey = ''<localhost_ip>'';
+    };
+  };
+}
+
+#+end_example
+- The above still causes errors:
+#+begin_example
+error:
+       Failed assertions:
+       - Exactly one of users.users.cardano-rt-view.isSystemUser and users.users.cardano-rt-view.isNormalUser must be set.
+
+       - Exactly one of users.users.relay.isSystemUser and users.users.relay.isNormalUser must be set.
+
+       - users.users.relay.group is unset. This used to default to
+       nogroup, but this is unsafe. For example you can create a group
+       for this user with:
+       users.users.relay.group = "relay";
+       users.groups.relay = {};
+#+end_example
+- I need a safe way to test that my import works, I tried limiting the file to just wireguard, but that itself is a service, so..
+- I want to trace down user errors above, I see there is reference to the relay user in the tutorial, I will need to go back and confirm the user exists. before going down other rabbit holes
+- I added the users to the configuration_include_cardano.nix
+#+begin_example
+  users.users.relay.group = "relay";
+  users.users.cartdano-rt-view.group = "cartdano-rt-view";
+  users.users.cardano-rt-view.group = "cardano-rt-view";
+  users.users.cardano-rt-view.isSystemUser = true; 
+  users.users.cartdano-rt-view.isSystemUser = true;
+  users.users.relay.isSystemUser = true;
+#+end_example
+- I had complaint about ssh config, I dedided to upload the diypool.tgz (https://github.com/diypool/diy/archive/refs/tags/v0.0.1.tar.gz) to my own repo so I could make changes
+- Added it to my public repo for now, updated the references in cardano-configuration.nix and now a rebuild works using https://github.com/bernokl/feedOurNeedCoop/raw/master/diy_refs/v0.0.1.tar.gz
+- TODO: Move the diy_refs to yumi repo
+- Current failure is on
+#+begin_example
+Jan 16 17:52:36 YUMI_DEV systemd[1]: Starting WireGuard Tunnel - wg0...
+Jan 16 17:52:36 YUMI_DEV wireguard-wg0-start[5042]: fopen: No such file or directory
+Jan 16 17:52:36 YUMI_DEV systemd[1]: wireguard-wg0.service: Main process exited, code=exited, status=1/FAILURE
+Jan 16 17:52:36 YUMI_DEV systemd[1]: wireguard-wg0.service: Failed with result 'exit-code'.
+Jan 16 17:52:36 YUMI_DEV systemd[1]: Failed to start WireGuard Tunnel - wg0.
+#+end_example
+- I need to see what the missing file is about
+- Rebuild:
+#+begin_src tmux :session s1
+nixos-rebuild switch
+#+end_src
+- The issue turns out to be the missing wg-key file when tf rebuilding a machine, for cost savings we still shut down and rebuild every night, it also helps keep the greenfields install tested. I added a step we have to manually add the /key/wg/publickey file to the instance before doing first cardano-configuration.nix nixos-rebuild refresh 
+#+begin_src tmux :session s1
+umask 077
+mkdir -p /keys/wg
+cd /keys/wg
+nix-shell -p wireguard-tools --run 'wg genkey | tee privatekey | wg pubkey > publickey'
+#+end_src
+- I do not understand why both nodes only have the "local" public key. I assume it is because the local node has all nodes defined, but still need to understand better.
+- This turns out because "local" is bastion, you ssh to it and nodes are both only availbale from bastion.
+- Need to understand communication with each other better
+- Local/Bastion machine run:
+- NOTE: THIS IS DEPRICATED, step 1 at the top of the documentation has configuration for bastion, this is itterating through when we were still figuring it out. If you finished step 1 all of the below should just work.
+#+begin_example
+ip link add dev wg0 type wireguard
+ip address add dev wg0 10.100.0.1/32
+# wg set wg0 listen-port 51820 private-key /path/to/private-key peer relay_host allowed-ips 10.100.0.2/32 endpoint [ec2 instance ip]:8172
+wg set wg0 listen-port 51820 private-key /keys/wg/privatekey peer BEHLemxebUPZRD4tFusW0DNvsSSvv0qWl+a3q3UwYlk= allowed-ips 10.100.0.2/32 endpoint 172.31.30.195:8172
+# wg set wg0 listen-port 51820 private-key /path/to/private-key peer relay-host allowed-ips 10.100.0.3/32 endpoint [ec2 instance ip]:8172
+wg set wg0 listen-port 51820 private-key /keys/wg/privatekey peer 6TxWzkXOQPz7yS/nf3s3nIGdWhSUyfqGsc8iPXRHPw4=  allowed-ips 10.100.0.3/32 endpoint 172.31.22.149:8172
+# Will do this when we have a second machine
+ip link set up dev wg0
+#+end_example
+- The above produced:
+#+begin_example
+root@ip-172-31-28-246:/keys/wg# wg
+interface: wg0
+  public key: gwb/UgbjYjJiDF7EztMG86jxQjBJA0fzq2MhxwY5F20=
+  private key: (hidden)
+  listening port: 51820
+
+peer: BEHLemxebUPZRD4tFusW0DNvsSSvv0qWl+a3q3UwYlk=
+  endpoint: 172.31.30.195:8172
+  allowed ips: 10.100.0.2/32
+
+peer: 6TxWzkXOQPz7yS/nf3s3nIGdWhSUyfqGsc8iPXRHPw4=
+  endpoint: 172.31.22.149:8172
+  allowed ips: 10.100.0.3/32
+#+end_example
+- Confirming the same on each of the hosts
+- relay-hosts
+#+begin_example
+[root@ip-172-31-30-195:/keys/wg]# wg
+interface: wg0
+  public key: BEHLemxebUPZRD4tFusW0DNvsSSvv0qWl+a3q3UwYlk=
+  private key: (hidden)
+  listening port: 51820
+
+peer: gwb/UgbjYjJiDF7EztMG86jxQjBJA0fzq2MhxwY5F20=
+  allowed ips: 10.100.0.1/32
+#+end_example
+- block-producer
+#+begin_example
+[root@ip-172-31-22-149:/keys/wg]# wg
+interface: wg0
+  public key: 6TxWzkXOQPz7yS/nf3s3nIGdWhSUyfqGsc8iPXRHPw4=
+  private key: (hidden)
+  listening port: 51820
+
+peer: gwb/UgbjYjJiDF7EztMG86jxQjBJA0fzq2MhxwY5F20=
+  allowed ips: 10.100.0.1/32
+#+end_example
+** Start the cardano relay node
+- Update /etc/nixos/cardano-configuration.nix
+#+begin_src tmux :session s1
+# Enable cardano-node
+services.stake-pool {
+  cardano-node {
+    enable = true;
+  };
+#+end_src
+- Make sure we have the package to do nix-fetch
+#+begin_src tmux :session s1
+nix-env -iA nixos.git
+#+end_src
+- And lets go pull the trigger and see if we can start up a relay-node
+#+begin_src tmux :session s1
+nixos-rebuild switch
+#+end_src
+- At this point I had to update configuration.nix to add the cardano-node user by adding
+#+begin_example
+users.users.cardano-node.isSystemUser = true;
+#+end_example
+- NOTE: This was resolved when step 1 above was compled, keeping for future troubleshooting reference.
+- I had problem that I could no longer get to the relay-node when it came up, turns out it adds a drop that effectively drop all traffic.
+- Deleting nixos-fw resolves the issue. I need to understand the firewall rules better so we can make sure we only let in what we want.
+- I did later put this back and current process uses the firewall rules as intended.
+- Also suspect that 10-100-0-1 should be 10.100.0.1 (hint this is lookup iptables does, real value can be seen with "-nL")
+#+begin_example
+ iptables -L --line-numbers | head
+Chain INPUT (policy ACCEPT)
+num  target     prot opt source               destination         
+1    ACCEPT     tcp  --  ip-10-100-0-1.ap-southeast-2.compute.internal  anywhere             tcp dpt:ssh ctstate NEW,ESTABLISHED
+2    ACCEPT     tcp  --  ip-10-100-0-1.ap-southeast-2.compute.internal  anywhere             tcp dpt:radan-http ctstate NEW,ESTABLISHED
+3    nixos-fw   all  --  anywhere             anywhere            
+
+[root@me]# iptables -D INPUT 3
+#+end_example
+- TODO: Fix firewall rules, the script creating these likely try to do this, but somehow the source gets transformed into amw url:
+#+begin_example
+iptables -A INPUT --protocol tcp --src 10.100.0.1 --jump ACCEPT
+
+[root@YUMI_DEV:~]# iptables -L --line-numbers | head
+Chain INPUT (policy ACCEPT)
+num  target     prot opt source               destination         
+1    ACCEPT     tcp  --  ip-10-100-0-1.ap-southeast-2.compute.internal  anywhere             tcp dpt:ssh ctstate NEW,ESTABLISHED
+2    ACCEPT     tcp  --  ip-10-100-0-1.ap-southeast-2.compute.internal  anywhere             tcp dpt:radan-http ctstate NEW,ESTABLISHED
+3    ACCEPT     tcp  --  ip-10-100-0-1.ap-southeast-2.compute.internal  anywhere            
+#+end_example
+- The confustion about text translation turns out to be iptables just doing lookup, doing "-nL" instead of "L" helps, but I still needed to learn that. 
+- Note that should have given me whitelisting for 10.100.0.1, I have no idea where the template to convert those comes from
+- Do we really care about firewall/wiregaurd? We can just as easily do this with pvc security in AWS, I do like the idea of preserving
+- I can work around this, for now I restarted the relay_host deploy that failed twice now, once for lack of CPU credits, 2nd time for lack of space even though there was still 4 gig left on root.
+- Last deploy took 3 hours with c5.xlarge (4 core, 8G ram)
+- Trying it wil c5.2xl (8 core, 16g ram) just to see if there is significant speed improvement for initial build, so far it did not seem to help much, it has been over 90 minutes. Will watch the node build, probably shut down if successfully provisioned, although I am not willing to lose any partial gains, it takes too long for this to spin up to spin it down every night at this point.
+- It took 5 hours, but the node did finally come up, and systemctl status showed running process, with no errors in the logs.
+- Sadly it came up on c5.2xlarge meaning it cost 50c per minute to run, it was late at night, I did not want to incur that cost for idle instance overnight. I tried to get the updated iptables rules persist. but iptables-save did not do what I hoped at 11PM. So now I rebuild the instance, I got up at 6AM to start it because I suspected there might be issues. It is now 11AM I am still waiting for it to finish... sigh. I scaled down to c5.xlarge looks like we should use 2xl and possibly above at least for the build.
+- Although, that said something smells rotten, going to verify cach keys just to make sure we are not doind something dumb like missing cache, although initial install of wireguard before we go cardano-node.enable = true shows no failed cache lookups. Will google how to manually do this.
+- TODO: Confirm caches defined in cardano-configuration.nix working 
+- For now we wait and I proceed with the block producer
+- HAPPY UPDATE. We have running relay_node! 
+- I can get to it with http://3.26.147.185:8088/ to view relay status
+- I see it is Node version 1.27.0
+- The relay-peer we have will not work with our version.
+#+begin_src tmux :session s1
+Domain: "preprod-node.world.dev.cardano.org" Application Exception: 3.72.231.105:30000 HandshakeError (VersionMismatch [NodeToNodeV_7] [8,9,10])
+#+end_src
+- This is I guess where we find out how flexible nix is. I will go spend some time poking at the upgrade process.
+- Ok this is promising change seems simple I need to update:
+#+begin_example
+    cardano-node-src = {
+      url = "https://github.com/input-output-hk/cardano-node/archive/refs/tags/1.27.0.tar.gz";
+      hash = "1c9zc899wlgicrs49i33l0bwb554acsavzh1vcyhnxmpm0dmy8vj";
+
+#+end_example
+- To be:
+#+begin_example
+    cardano-node-src = {
+      url = "https://github.com/input-output-hk/cardano-node/archive/refs/tags/1.35.4.tar.gz";
+      hash = ????????? I have tried nix has file with every one of its options to see if I could get hash of 1.27 to match what we have above, but no joy yet." 
+#+end_example
+- Finally learned the right way to do this, the steps after this is a cheat to get nix to tell you
+- Here is the right way to get that hash
+#+begin_src tmux :session s1
+nix-prefetch-url --unpack https://github.com/input-output-hk/cardano-node/archive/refs/tags/1.27.0.tar.gz
+#+end_src
+- Returns:
+#+begin_example
+1c9zc899wlgicrs49i33l0bwb554acsavzh1vcyhnxmpm0dmy8vj
+#+end_example
+- This is me fumbling uround till I get to flakes below.
+- OK Cant find how to create the hash, but from earlier experience if I put the updated url, but leave the hash it should error out telling me what it needs. Lets see.
+- Boo, complained it could not find a store-path, mmm.
+- Ha, ok I created my own hash with:
+#+begin_src tmux :session s1
+nix-hash --type sha256 --flat --base32 1.35.4.tar.gz
+#+end_src
+- Ran it again and got:
+#+begin_example
+[root@ip-172-31-23-164:~]# nixos-rebuild switch
+error: hash mismatch in file downloaded from 'https://github.com/input-output-hk/cardano-node/archive/refs/tags/1.35.4.tar.gz':
+         specified: sha256:01mpzw8w030ixfswmbpp11dbh9f66vr1myp80ajzdr756vsg46mh
+         got:       sha256:1j01m2cp2vdcl26zx9xmipr551v3b2rz9kfn9ik8byfwj1z7652r
+(use '--show-trace' to show detailed location information)
+building Nix...
+#+end_example
+- Updating to the "got:" hash, fingers crossed
+- Blocked by:
+#+begin_example
+error: experimental Nix feature 'flakes' is disabled; use '--extra-experimental-features flakes' to override
+#+end_example
+- Add the following line to configuration.nix (this turns out to do nothing for my problem)
+#+begin_example
+  nix.settings.experimental-features = [ "nix-command" "flakes" ];
+#+end_example
+- Still no joy, update .config/nix/nix.conf (This works, it reliably enables flakes)
+#+begin_src tmux :session s1
+ mkdir -p ~/.config/nix
+echo "experimental-features = nix-command flakes" >> ~/.config/nix/nix.conf
+#+end_src
+- Rebuild:
+#+begin_src tmux :session s1
+nixos-rebuild switch
+#+end_src
+- JOY!
+#+begin_example
+> cardano-cli --version
+cardano-cli 1.35.4 - linux-x86_64 - ghc-8.10
+git rev 0000000000000000000000000000000000000000
+#+end_example
+- WE CAN UPDATE OUR NODE AS NEEDED, WHOOP!
+- Never got this node to sync with testnet, but it works for mainnet, so proceeding with POC of real pool
+- I suspect there are configurations included with this repos set to use mainnet, I need to dig in and see what, but there are better dev-env tutorials
+
+** Start block-producer 
+- On the relay-node generate some generic keys
+- Note we can only access this node via the bastion host, be aware that you will be locked out if you restart and do not have working bastion host connections
+   #+begin_src tmux :session tmux-old-host
+cardano-cli node key-gen \
+--cold-verification-key-file cold.vkey \
+--cold-signing-key-file cold.skey \
+--operational-certificate-issue-counter-file cold.counter
+   #+end_src
+   #+begin_src tmux :session tmux-old-host
+cardano-cli node key-gen --cold-verification-key-file cold.vkey --cold-signing-key-file cold.skey --operational-certificate-issue-counter-file cold.counter
+   #+end_src
+  - following a few examples
+#+begin_src tmux :session s1
+cardano-cli node key-gen-KES \
+  --verification-key-file kes.vkey \
+  --signing-key-file kes.skey
+#+end_src
+- This worked as well
+- I need to get the current <KES_PERIOD>, the suggested command to do this:
+#+begin_src tmux :session s1
+expr $(cardano-cli query tip --mainnet | nix-shell -p jq --run 'jq .slot') / $(nix-shell -p curl jq --run 'curl -s https://book.world.dev.cardano.org/environments/mainnet/shelley-genesis.json | jq .slotsPerKESPeriod')
+#+end_src
+- Returns:
+#+begin_example
+3
+#+end_example
+- So I guess we update the below kes-period with 3
+#+begin_src tmux :session s1
+cardano-cli node issue-op-cert \
+  --kes-verification-key-file kes.vkey \
+  --cold-signing-key-file cold.skey \
+  --operational-certificate-issue-counter cold.counter \
+  --kes-period <KES_PERIOD> \
+  --out-file node.cert
+#+end_src
+- Back on the block-producer node.
+- I need to go add the producer user to our configuration.nix
+#+begin_example
+ users.users.producer.group = "producer";
+  users.users.cardano-node.isSystemUser = true;
+#+end_example
+- Lets go add the files we generated earlier:
+- Note vrf.skey is the cold.skey we generated above
+#+begin_example
+     kesKey = "/keys/bp/kes.skey";
+      vrfKey = "/keys/bp/vrf.skey";
+      operationalCertificate = "/keys/bp/node.cert";
+    };
+#+end_example
+- Turns out important to make sure the keys can only be read by file owner
+#+begin_src 
+sudo chmod 400 /keys/bp/*
+#+end_src
+- Go update cardano-configuration.nix to have "cardano-node = enable"
+- Rebuild.
+#+begin_src tmux :session s1
+nixos-rebuild switch
+#+end_src
+OK. I see build going on.
+* Current
+- ## We have working relay and idle block producer, waiting for relay to finish syncing
+- ## Big negative I could never get this relay to sync with the testnet relay provided in https://book.world.dev.cardano.org/environments/pv8/topology.json I suspect this is because the diypool config calls for mainnet specific config files. I could never find where, it might be in the cardano config that references
+- ## TODO: Make this node pair work with testnet.
+- ## We can upgrade our node version, decided to finish this POC as mainnet as it is the intended final use in any case. Our relay host is running, syncing with peers. I started the process for building the block producer. All WG kinks have been worked out, if our block producer completes, we pretty much have standard syntax to update pool parameters etc,
+- ## This complete guide for how Yumi stake pool instructions for aws diypool_apply.org is used to stand up its own stakepool in AWS, this should be simple enough to replicate on hardware.
+* My TODO
+- # I need to add automated shutdown schedule for aws until we have prod
+- # I need to create secrets for things like ssh keys
+* Cool new stuff
+** Install package in nix
+- This is decent, but did not make -qaP clear https://matthewrhone.dev/nixos-package-guide   
+- I ask anybody that has the right guide to post it here, but it took way to long to figure out how to find a package and install it.
+- tldr; nix-env -qaP 'vim' && nix-env -i vim-9.0.0609
+- To make it pemanent you need to add environment.systemPackages to configuration.nix. Not sure how yet, for now this give me instant gratification 
+#+begin_example
+[root@ip-172-31-22-57:~]# nix-env -qaP 'vim'
+nixos.vim  vim-9.0.0609
+
+[root@ip-172-31-22-57:~]# nix-env -i vim-9.0.0609
+installing 'vim-9.0.0609'
+this path will be fetched (7.81 MiB download, 37.92 MiB unpacked):
+  /nix/store/y5fcw4xnkg8hwaaf35nfc41vdzy32cm7-vim-9.0.0609
+copying path '/nix/store/y5fcw4xnkg8hwaaf35nfc41vdzy32cm7-vim-9.0.0609' from 'https://cache.nixos.org'...
+building '/nix/store/kyx9gz5b9w4a21ywhbamg76wncdkpcww-user-environment.drv'...
+
+[root@ip-172-31-22-57:~]# vim /etc/nixos/configuration.nix
+
+[root@ip-172-31-22-57:~]nix-env --uninstall vim-9.0.0609
+#+end_example
+* Lessons learned
+** Encrypted root volume  
+- For some reason in terraform main.tf template_cloudinit_config caused encryption of configuration.nix, I disabled base64_encode and switched from incorrect /bin/bash to /bin/sh, and that fixed the issue. I still do not understand exact RC
+- This was my first pass at adding a swap file, intent was to create script that can do this.
+- THIS IS VERY WRONG, IN NIXOS SWAP GETS CREATED IN /etc/nixos/configuration.nix, but I did not know and this showed me early on that something was wrong with the filesystem.
+#+begin_example
+dd if=/dev/zero of=/swapfile1 bs=1024 count=17004288
+chown root:root /swapfile1
+chmod 0600 /swapfile1
+mkswap /swapfile1
+swapon /swapfile1
+free -g
+htop
+vi /etc/fstab
+# add "/swapfile1 none swap sw 0 0"
+#+end_example
+- All worked except adding the swapfile to fstab, in this instance fstab is in /nix/store/*-etc-fstab
+- Figuring out how to add the entry. It looks like there might be a better way to do swap management for nix, but documentation is a bit scattered.
+- Going to see if I can just find a way to add that entry to fstab for now
+- Issue has been I can not update /etc/nixos/configuration.nix, when I cat it it seems to be encrypted.
+- OK this is a very deep rabbit hole. I need to understand more about the nix architecture to interact with this AMI. I am going back to basics following some documentation recomended for nixos-getting started.
+- mmmm machine to small to finish package lookup, replacing with t1.medium
+- OK, turns out something in template_cloudinit_config was causing configuration.nix to be encrypted, commenting out and updating the section fixed the problem, I can now creggate my swap file using updates to configuration.nix
+** Next dumbassery...

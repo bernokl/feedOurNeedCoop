@@ -1,0 +1,257 @@
+* Practical install of AWS node from local machine
+** Clone repo
+- This is a private repo, so you will need access granted
+#+begin_src tmux :session s1
+git clone git@github.com:feedONeedai/docs.git
+#+end_src
+** Log into aws
+- Confirm you have git/terraform/aws-cli installed, getting_started_linux_install_local_tools.org has a few links to help install these tools
+- Make sure you are logged into aws-cli
+#+begin_src tmux :session s1
+aws sts get-caller-identity
+#+end_src
+- Returns:
+#+begin_example
+{
+    "Arn": "arn:aws:iam::22222222222:user/berno.kleinhans@feedONeed.com",
+    "Account": "246444444444447",
+    "UserId": "AAAAAAAAAAAAAAIY3FGVE"
+}
+#+end_example
+- Also confirm region:
+#+begin_src tmux :session s1
+ aws configure get region
+#+end_src
+- Returns
+#+begin_example
+ap-southeast-2
+#+end_example
+** Build out relay node
+ #+begin_src tmux :session
+ cd feedONeedai/docs/bernoHome/terraform/ec2-cardano-node/relay_node
+ #+end_src
+- Make sure you have a local private key for a key that exists in AWS, if you do not create one.
+- You can log into the console and simply add-key in ec2 console, download pem and note the name for the next step
+- Or if you have nix installed locally you can create your key with ec2-tools:
+#+begin_src tmux :session s1
+ec2-add-keypair -O [aws_access_key_id] -W [aws_secret_access_key] -k [your_keyname_here] 
+#+end_src
+- Once you have the key update the name in variables.tf
+#+begin_example
+variable "key_name" {
+  type    = string
+  default = "feedONeed-test-4" // FIXME: replace the key name here
+}
+#+end_example
+- Now terrafom, init, apply
+#+begin_src tmux :session s1
+terraform init && terraform apply
+#+end_src
+- Give it a couple of minutes to finish coming up
+- You can now go grab the public ip for your instance in the AWS-web console
+- CHALLENGE FOR THE READER. There is a aws-cli one-liner to get the ip for our new node, come add that command to the documentation.
+- Repeat the same steps as above for ymiai/docs/bernoHome/terraform/ec2-cardano-node/block_producer_node, you need both nodes up before you can finish the installs
+** Customize the nodes
+- This is steps for both relay and block producer, will start with block producer
+- From here we have manual steps we still need to automate.
+- ssh to instance 
+#+begin_src tmux :session s1
+ ssh -i ~/Downloads/feedONeed-test-4.pem root@52.62.46.229
+#+end_src
+- Make configuration.nix writable
+- TODO: Update file permissions in terraform
+#+begin_src tmux :session s1
+  chmod 644 /etc/nixos/configuration.nix
+#+end_src
+- Replace the content of configuration.nix with the content of files/configuration_include_cardano.nix (Make sure you use the files from the respective relay_node OR block_producer_nod
+#+begin_src tmux :session s1
+## TODO install vim in orig configuration
+nix-env -qaP 'vim'
+nix-env -i vim-9.0.0609
+vim /etc/nixos/configuration.nix
+#+end_src
+- Next create a copy of terraform/ec2-cardano-node/relay_node/files/cardano-configuration.nix on the remote machine, again note there is a difference betwenn the relay and block configuration grab the right one for the right machine from your repo
+- For the remote machine make sure you update:
+#+begin_example
+- Public ssh key, you can get it on the remote machine in .ssh/authorized_keys
+    ssh = {
+      port = 22;
+      public-key = ''[public-key for feedONeed-test-4]'';
+    };
+- The peer node ip, this is why we had to wait for these instances, the relay_node gets the block_producer private ip and vice versa
+    topology = [
+      {
+        addr = "<relay-node-ip>";
+        port = 3001;
+- Wireguard public key, this is the key for the "local" or 3rd machine that is not a cardano node. In my case I have a vanilla ubuntu machine. I will capture setup for seperate
+    wireguard = {
+      port = 51820;
+      peerPublicKey = ''<localhost_wg_publickey>'';
+    };
+#+end_example
+#+begin_src tmux:session s1
+vim /etc/nixos/cardano-configuration.nix
+#+end_src
+- Before you update the nodes you need to generate the wireguard public keys 
+#+begin_src tmux :session s1
+umask 077
+mkdir -p /keys/wg
+cd /keys/wg
+nix-shell -p wireguard-tools --run 'wg genkey | tee privatekey | wg pubkey > publickey'
+#+end_src
+- Cat out your keys so you have them for bastion wg configuration
+#+begin_src tmux :session s1 
+cat /keys/wg/publickey 
+cat /keys/wg/privatekey
+#+end_src
+- Lets start wireguard
+#+begin_src tmux :session s1
+nixos-rebuild switch
+#+end_src
+- If your fields have been updated you should now be ready to uptdate nix to enable cardano-node
+- Update cardano-configuration.nix "cardano-node=enable"
+- One more thing, they use git features that needs this package
+#+begin_src tmux :session s1
+nix-env -iA nixos.git
+#+end_src
+- Lets enable flakes per the latest node requirement
+#+begin_src tmux :session s1
+ mkdir -p ~/.config/nix
+echo "experimental-features = nix-command flakes" >> ~/.config/nix/nix.conf
+#+end_src
+- And lets go pull the trigger and see if we can start up a relay-node
+#+begin_src tmux :session s1
+nixos-rebuild switch
+#+end_src
+- YAS, that resulted in runing relay node with wiregaurd only allowing access to the node from the bastion
+** Create keys for block producer
+- We will now create keys on our relay-node so we can populate the /keys/bp/ files on the producer.
+- We will need the keys to start our block producer 
+- I can also see this as something that should be done on the producer, perhaps starting it as relay first, but either way, here we are
+- On relay run the following to create the cold.key, cold.skey and cold.counter
+   #+begin_src tmux :session tmux-old-host
+cardano-cli node key-gen \
+--cold-verification-key-file cold.vkey \
+--cold-signing-key-file cold.skey \
+--operational-certificate-issue-counter-file cold.counter
+   #+end_src
+- Generate the kesKeys
+#+begin_src tmux :session s1
+cardano-cli node key-gen-KES \
+  --verification-key-file kes.vkey \
+  --signing-key-file kes.skey
+#+end_src
+- Next go find the current slot period
+#+begin_src tmux :session s1
+expr $(cardano-cli query tip --mainnet | nix-shell -p jq --run 'jq .slot') / $(nix-shell -p curl jq --run 'curl -s https://book.world.dev.cardano.org/environments/mainnet/shelley-genesis.json | jq .slotsPerKESPeriod')
+#+end_src
+- Now use the output from above to substitute the <KES_PERIOD> and generate the certificate
+#+begin_src tmux :session s1
+cardano-cli node issue-op-cert \
+  --kes-verification-key-file kes.vkey \
+  --cold-signing-key-file cold.skey \
+  --operational-certificate-issue-counter cold.counter \
+  --kes-period <KES_PERIOD> \
+  --out-file node.cert
+#+end_src
+** Build block producer
+- Repeat "Build out relay node", stopping bedfore enabling cardano-node
+- You will need to make sure you add a producer to configuration.nix
+#+begin_example
+ users.users.producer.group = "producer";
+  users.users.cardano-node.isSystemUser = true;
+#+end_example
+- Lets go add the files we generated earlier:
+#+begin_example
+     kesKey = "/keys/bp/kes.skey";
+      vrfKey = "/keys/bp/vrf.skey";
+      operationalCertificate = "/keys/bp/node.cert";
+    };
+#+end_example
+- From the relay_host cat the above files copying the content into the paths above
+- Lets buildour block producer
+#+begin_src tmux :session s1
+nixos-rebuild switch
+#+end_src
+- The block producer is building up and running idle waiting for the relay to finish
+  
+* Set up bastion host using wiregaurd on the 3rd instance
+- I simply spun up a vanilla ubuntu instance using the aws console in the region we did the nodes
+- I then installed wireguard
+#+begin_src tmux :session s1 
+sudo apt install wireguard-tools
+#+end_src
+- Next generate some keys
+#+begin_src tmux :session s1
+umask 077
+mkdir -p /keys/wg
+cd /keys/wg
+wg pubkey < privatekey > publickey
+#+end_src
+- Configure wireguard for nodes. 
+- TODO: NOTE the config below will not persist, you will have to output it to a wiregaurd config file if you want it to persist, leaving mine ephemeral for now so I can test
+- OK, did hybrid manual and config file, need to learn to do this correctly.
+- Ran this:
+#+begin_src tmux :session s1
+ ip link add dev wg0 type wireguard
+ip address add dev wg0 10.100.0.1/32
+#+end_src
+- Created this config in /etc/wireguard/wg0.conf
+- I am aware this document shares privatekeys, these instances will all be replaced when we go live
+#+begin_example
+[Interface]
+PrivateKey = XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXx=
+ListenPort = 51820
+
+[Peer]
+PublicKey = XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXUviE=
+AllowedIPs = 10.100.0.3/32
+Endpoint = 13.210.107.236:51820
+PersistentKeepalive = 21
+
+#[Peer]
+#PublicKey = <BP_WG_PUBLIC_KEY>
+#AllowedIPs = 10.100.0.2/32
+#Endpoint = <BP_IP>:<BP_WG_PORT>
+#PersistentKeepalive = 21
+#+end_example
+- I aplied the above to my running wireguard with:
+#+begin_src tmux :session s1
+wg setconf wg0 /etc/wireguard/wg0.conf
+#+end_src
+- I had to manually bring up the wg0 device
+#+begin_src tmux :session s1
+  ip link set up dev wg0
+#+end_src
+- I noticed this did not provide my machine with a route for the wg0 traffic so I manually ran:
+- This is still critical step, need to figure out how to get route added with wireguard
+#+begin_src tmux :session s1
+ip route add 10.100.0.0/24 dev wg0
+#+end_src
+- Another change is to manually whitelist the external ips for each instance in the security group attached to each instance.
+- Go to aws-console -> ec2 -> instances -> select an instance -> click security tab in bottom half. click on the sg-00a4c2c369b....xx. link. 
+- You are now on the page with the security group attached to the instance, make sure for incoming traffic you allow the relevant ports from the ip address of the other instances it will be communicating with.
+- Ideally all 3 share the same security group and you can simply whitelist the 3 ips (relay, block, bastion) in that one security group. You can find the external ip for each node in the ec2-aws-consle
+- From this point forward I could reach relay nodes using the 10. address
+#+begin_example
+> telnet 10.100.0.3 22
+Trying 10.100.0.3...
+Connected to 10.100.0.3.
+Escape character is '^]'.
+SSH-2.0-OpenSSH_9.1
+#+end_example
+- NOTE: The above is far from ideal we are routing our encrypted traffic via public networks when we could do all of this isolation with AWS VPC and no public ip on our block producer. I did choose to make this work via external ips because I suspect that is more the intent for how it will be used over public networks. We have been discussing tailscale for this network topology security so for now this wiregaurd configuration sticks to the original design intent best.
+- TODO: Do the above using tailscale, you will need to go up into the diy.configuration.nix to replace wireguard configuration with talescale.
+
+* Current
+- ## Fully working mainnet relay_node. Block producer came up running idle waiting for relay to finish. It also has not been registered as this is mainnet I wanted to do this when we were fully comfortable. Looks like wireguard will give only our bastion access to these two nodes. This bastion can do with review of its security groups
+* My ToDo:
+- # I need to add automated shutdown schedule for aws until we have prod
+- # I need to create secrets for things like ssh keys
+
+
+
+
+
+
+

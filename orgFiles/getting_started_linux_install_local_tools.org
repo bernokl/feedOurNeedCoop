@@ -1,0 +1,44 @@
+# Quick overview to set up aws/terraform/nix
+- For a few I just left link to online guide, the tools evolve and I figure getting steps from source will hopefully evolve along
+- TODO: Would be nice to get content scraped and populated in blocks, I know HH had tool for this, but parking as distraction
+* Get aws set up
+- Go get your access keys by going to aws-console, there is a guide [[https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html][here]] 
+- In the navigation bar on the upper right, choose your user name, and then choose My Security Credentials.
+- Expand the Access keys (access key ID and secret access key) section
+- To create an access key, choose Create New Access Key
+- Download Key File.
+- Get aws cli set up, you can find a guide [[https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html][here]] 
+#+BEGIN_SRC tmux :session s1                                                 
+ cd ~/Downloads curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+ unzip awscliv2.zip
+ sudo ./aws/install 
+#+end_src
+- The setup should ask you for the access_key_id and aws_secret_access key, plus region, we are using: ap-southeast-2
+- You chould now have ~/.aws/config and ~/.aws/credentials with the information from the last step.
+- Or simpler run "aws configure"
+- Test your setup with:
+#+begin_src tmux :session s1
+  aws sts get-caller-identity
+#+end_src
+- Mine returns my UserId, account and arn:
+#+begin_example
+ "Arn": "arn:aws:iam::000000000000:user/berno.kleinhans@feedONeed.com"
+#+end_example 
+* Terraform setup
+- There is a nice guide [[https://developer.hashicorp.com/terraform/tutorials/aws-get-started/install-cli][here]]
+- After install confirm with:
+#+begin_src tmux :session s1
+terraform -version
+#+end_src
+* Nix install
+- I did multi-user install, you can find a good guide [[https://nixos.org/download.html#nix-install-linux][here]]
+#+begin_src tmux :session s1
+sh <(curl -L https://nixos.org/nix/install) --daemon
+#+end_src
+- once installed confirm your version with
+#+begin_src tmux :session s1
+nix --version
+#+end_src
+- I have 2.6.0. I see latest is 2.11.0 I might come back and upgrade, lets get started
+- We will keep an eye if there are more standard tools in the feedONeed toolbox we will add them to this.
+  
